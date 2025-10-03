@@ -1473,6 +1473,8 @@ class ldst_unit : public pipelined_simd_unit {
   unsigned long long m_last_inst_gpu_tot_sim_cycle;
 
   std::vector<std::deque<mem_fetch *>> l1_latency_queue;
+  // Custom add: another L1 latency to replicate SSM behaviour
+  std::vector<std::deque<mem_fetch *>> ssm_latency_queue;
   void L1_latency_queue_cycle();
 };
 
