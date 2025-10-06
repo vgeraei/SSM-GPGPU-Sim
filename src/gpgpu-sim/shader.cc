@@ -2081,29 +2081,53 @@ mem_stage_stall_type ldst_unit::process_memory_access_queue_l1cache(
 //      unsigned set_index = m_config.set_index(addr);
       // if (m_config->m_L1D_config.set_index( mf->get_addr());
 
-      fprintf(stdout, "Set number: %u\n", m_config->m_L1D_config.set_index( mf->get_addr()));
+      // fprintf(stdout, "Set number: %u\n", m_config->m_L1D_config.set_index( mf->get_addr()));
+      if (m_config->m_L1D_config.set_index( mf->get_addr()) != 3) {
+        if ((l1_latency_queue[bank_id][m_config->m_L1D_config.l1_latency - 1]) ==
+            NULL) {
+          l1_latency_queue[bank_id][m_config->m_L1D_config.l1_latency - 1] = mf;
 
-      if ((l1_latency_queue[bank_id][m_config->m_L1D_config.l1_latency - 1]) ==
-          NULL) {
-        l1_latency_queue[bank_id][m_config->m_L1D_config.l1_latency - 1] = mf;
+          if (mf->get_inst().is_store()) {
+            unsigned inc_ack =
+                (m_config->m_L1D_config.get_mshr_type() == SECTOR_ASSOC)
+                    ? (mf->get_data_size() / SECTOR_SIZE)
+                    : 1;
 
-        if (mf->get_inst().is_store()) {
-          unsigned inc_ack =
-              (m_config->m_L1D_config.get_mshr_type() == SECTOR_ASSOC)
-                  ? (mf->get_data_size() / SECTOR_SIZE)
-                  : 1;
+            for (unsigned i = 0; i < inc_ack; ++i)
+              m_core->inc_store_req(inst.warp_id());
+          }
 
-          for (unsigned i = 0; i < inc_ack; ++i)
-            m_core->inc_store_req(inst.warp_id());
+          inst.accessq_pop_back();
+        } else {
+          result = BK_CONF;
+          m_stats->gpgpu_n_l1cache_bkconflict++;
+          delete mf;
+          break;  // do not try again, just break from the loop and try the next
+                  // cycle
         }
+      } else {// Custom add
+        if ((ssm_latency_queue[bank_id][m_config->m_L1D_config.l1_latency - 1]) ==
+            NULL) {
+          ssm_latency_queue[bank_id][m_config->m_L1D_config.l1_latency - 1] = mf;
 
-        inst.accessq_pop_back();
-      } else {
-        result = BK_CONF;
-        m_stats->gpgpu_n_l1cache_bkconflict++;
-        delete mf;
-        break;  // do not try again, just break from the loop and try the next
-                // cycle
+          if (mf->get_inst().is_store()) {
+            unsigned inc_ack =
+                (m_config->m_L1D_config.get_mshr_type() == SECTOR_ASSOC)
+                    ? (mf->get_data_size() / SECTOR_SIZE)
+                    : 1;
+
+            for (unsigned i = 0; i < inc_ack; ++i)
+              m_core->inc_store_req(inst.warp_id());
+          }
+
+          inst.accessq_pop_back();
+        } else {
+          result = BK_CONF;
+          m_stats->gpgpu_n_l1cache_bkconflict++;
+          delete mf;
+          break;  // do not try again, just break from the loop and try the next
+                  // cycle
+        }
       }
     }
     if (!inst.accessq_empty() && result != BK_CONF) result = COAL_STALL;
@@ -2214,6 +2238,99 @@ void ldst_unit::L1_latency_queue_cycle() {
       if (l1_latency_queue[j][stage] == NULL) {
         l1_latency_queue[j][stage] = l1_latency_queue[j][stage + 1];
         l1_latency_queue[j][stage + 1] = NULL;
+      }
+  }
+
+  // Custom add
+  for (unsigned int j = 0; j < m_config->m_L1D_config.l1_banks; j++) {
+    if ((ssm_latency_queue[j][0]) != NULL) {
+      mem_fetch *mf_next = ssm_latency_queue[j][0];
+      std::list<cache_event> events;
+      enum cache_request_status status =
+          m_L1D->access(mf_next->get_addr(), mf_next,
+                        m_core->get_gpu()->gpu_sim_cycle +
+                            m_core->get_gpu()->gpu_tot_sim_cycle,
+                        events);
+
+      bool write_sent = was_write_sent(events);
+      bool read_sent = was_read_sent(events);
+
+      if (status == HIT) {
+        assert(!read_sent);
+        ssm_latency_queue[j][0] = NULL;
+        if (mf_next->get_inst().is_load()) {
+          for (unsigned r = 0; r < MAX_OUTPUT_VALUES; r++)
+            if (mf_next->get_inst().out[r] > 0) {
+              assert(m_pending_writes[mf_next->get_inst().warp_id()]
+                                     [mf_next->get_inst().out[r]] > 0);
+              unsigned still_pending =
+                  --m_pending_writes[mf_next->get_inst().warp_id()]
+                                    [mf_next->get_inst().out[r]];
+              if (!still_pending) {
+                m_pending_writes[mf_next->get_inst().warp_id()].erase(
+                    mf_next->get_inst().out[r]);
+                m_scoreboard->releaseRegister(mf_next->get_inst().warp_id(),
+                                              mf_next->get_inst().out[r]);
+                m_core->warp_inst_complete(mf_next->get_inst());
+              }
+            }
+
+          // release LDGSTS
+          if (mf_next->get_inst().m_is_ldgsts) {
+            m_pending_ldgsts[mf_next->get_inst().warp_id()]
+                            [mf_next->get_inst().pc]
+                            [mf_next->get_inst().get_addr(0)]--;
+            if (m_pending_ldgsts[mf_next->get_inst().warp_id()]
+                                [mf_next->get_inst().pc]
+                                [mf_next->get_inst().get_addr(0)] == 0) {
+              m_core->unset_depbar(mf_next->get_inst());
+            }
+          }
+        }
+
+        // For write hit in WB policy
+        if (mf_next->get_inst().is_store() && !write_sent) {
+          unsigned dec_ack =
+              (m_config->m_L1D_config.get_mshr_type() == SECTOR_ASSOC)
+                  ? (mf_next->get_data_size() / SECTOR_SIZE)
+                  : 1;
+
+          mf_next->set_reply();
+
+          for (unsigned i = 0; i < dec_ack; ++i) m_core->store_ack(mf_next);
+        }
+
+        if (!write_sent) delete mf_next;
+
+      } else if (status == RESERVATION_FAIL) {
+        assert(!read_sent);
+        assert(!write_sent);
+      } else {
+        assert(status == MISS || status == HIT_RESERVED);
+        ssm_latency_queue[j][0] = NULL;
+        if (m_config->m_L1D_config.get_write_policy() != WRITE_THROUGH &&
+            mf_next->get_inst().is_store() &&
+            (m_config->m_L1D_config.get_write_allocate_policy() ==
+                 FETCH_ON_WRITE ||
+             m_config->m_L1D_config.get_write_allocate_policy() ==
+                 LAZY_FETCH_ON_READ) &&
+            !was_writeallocate_sent(events)) {
+          unsigned dec_ack =
+              (m_config->m_L1D_config.get_mshr_type() == SECTOR_ASSOC)
+                  ? (mf_next->get_data_size() / SECTOR_SIZE)
+                  : 1;
+          mf_next->set_reply();
+          for (unsigned i = 0; i < dec_ack; ++i) m_core->store_ack(mf_next);
+          if (!write_sent && !read_sent) delete mf_next;
+        }
+      }
+    }
+
+    for (unsigned stage = 0; stage < m_config->m_L1D_config.l1_latency - 1;
+         ++stage)
+      if (ssm_latency_queue[j][stage] == NULL) {
+        ssm_latency_queue[j][stage] = ssm_latency_queue[j][stage + 1];
+        ssm_latency_queue[j][stage + 1] = NULL;
       }
   }
 }
@@ -2646,11 +2763,17 @@ ldst_unit::ldst_unit(mem_fetch_interface *icnt,
                          IN_L1D_MISS_QUEUE, core->get_gpu(), L1_GPU_CACHE);
 
     l1_latency_queue.resize(m_config->m_L1D_config.l1_banks);
+    // Custom add 
+    ssm_latency_queue.resize(m_config->m_L1D_config.l1_banks);
     assert(m_config->m_L1D_config.l1_latency > 0);
 
-    for (unsigned j = 0; j < m_config->m_L1D_config.l1_banks; j++)
+    // Custom add
+    for (unsigned j = 0; j < m_config->m_L1D_config.l1_banks; j++) {
       l1_latency_queue[j].resize(m_config->m_L1D_config.l1_latency,
                                  (mem_fetch *)NULL);
+      ssm_latency_queue[j].resize(60,
+                                 (mem_fetch *)NULL);
+    }
   }
   m_name = "MEM ";
 }
