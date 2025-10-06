@@ -2082,7 +2082,8 @@ mem_stage_stall_type ldst_unit::process_memory_access_queue_l1cache(
       // if (m_config->m_L1D_config.set_index( mf->get_addr());
 
       // fprintf(stdout, "Set number: %u\n", m_config->m_L1D_config.set_index( mf->get_addr()));
-      if (m_config->m_L1D_config.set_index( mf->get_addr()) != 3) {
+             //m_config->m_L1D_config.set_index( mf->get_addr()) != 3
+      if (true) {
         if ((l1_latency_queue[bank_id][m_config->m_L1D_config.l1_latency - 1]) ==
             NULL) {
           l1_latency_queue[bank_id][m_config->m_L1D_config.l1_latency - 1] = mf;
